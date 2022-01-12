@@ -6,11 +6,10 @@
 #include "get_time.h"
 #include "mpi.h"
 
-// solves simple linear system using least squares pdgels routine
-// for A*x = b, where A is a diagonal matrix with A[i][i] = i+1, and b[i] = 1.
-// A is nxn, where n is a scalar multiple of numprocs. Each process
-// computer n/numprocs rows, since numprocsx1 layout is used in this example.
-// Entries of the solution should be x[i] = 1.0/(i+1)
+
+// computes QR factorization using LAPACK and SCALAPACK routines and explicitly extracts Matrices Q and R.
+// Thorough tests are performed to compare results and performance of SCALAPACK to that of SCALAPACK.
+// Currently number of columns in a matrix must be a multiple of number of processors.
 
 void blacs_pinfo_(int*, int*);
 void blacs_get_(int*, int*, int*);
@@ -24,40 +23,38 @@ void dgeqrf_(int * M, int *N, double *A, int *LDA,
              double *TAU, double *WORK, int *LWORK, int *INFO);
 
 void dorgqr_(int *M, int *N, int *K, double *A, int *LDA,
-            double *TAU, double *WORK, int *LWORK, int *INFO);
+             double *TAU, double *WORK, int *LWORK, int *INFO);
 
 void pdgeqrf_(int *M, int *N, double *A, int *IA, int *JA, int *DESCA,
               double *TAU, double *WORK, int *LWORK, int *INFO);
 
 void pdorgqr_(int *M, int *N, int *K, double *A, int *IA, int *JA, int *DESCA,
               double *TAU, double *WORK, int *LWORK, int *INFO);
-double compute_norm(int len, double *v)
-{
-   double norm = 0.0;
-   for(int i = 0; i < len; ++i)
-      norm += v[i]*v[i];
 
-   return sqrt(norm);
-}
+void PrintFull(int M, int N, double *A, const char *name);
+void PrintUpper(int M, int N, double *A, const char *name);
+double compute_norm(int len, double *v);
+double computeRes(int len, double *A, double *B);
 
 int main(int argc, char *argv[])
 {
    int mpi_err, numprocs, procId, tag;
    MPI_Status status;
-   int nrowsTot = 1000;
+   int nrowsTot = 2000;
    int ncolsTot = 1000;
    double **bcyclA;
-   double *A, *ALoc;
+   double *A, *ALoc, *RLoc, *ALapack, *RLapack;
    double *A_MPI, *Q_MPI, *R_MPI;
 
    mpi_err = MPI_Init(&argc, &argv);
    mpi_err = MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
    mpi_err = MPI_Comm_rank(MPI_COMM_WORLD, &procId);
    if(procId == 0)
-      printf("running with %i processes\n", numprocs);
+      printf("running with %i MPI processes\n\n", numprocs);
 
    int ncolsLoc = ncolsTot/numprocs;
    ALoc = (double *)malloc(nrowsTot*ncolsLoc*sizeof(double));
+   RLoc = (double *)malloc(ncolsTot*ncolsLoc*sizeof(double));
    if(procId == 0)
    {
       A_MPI = (double *)malloc(nrowsTot*ncolsTot*sizeof(double));
@@ -69,36 +66,29 @@ int main(int argc, char *argv[])
             A[j*nrowsTot+i] = (double)rand() / (double) RAND_MAX;
 
       {
-         // Allocate copies so that identical problem will be solved with lapack
-         double *A_copy = (double *)malloc(nrowsTot*ncolsTot*sizeof(double));
-         memcpy(A_copy, A, nrowsTot*ncolsTot*sizeof(double));
+         // Allocate copy so that identical problem will be solved with lapack
+         ALapack = (double *)malloc(nrowsTot*ncolsTot*sizeof(double));
+         memcpy(ALapack, A, nrowsTot*ncolsTot*sizeof(double));
 
          int INFO;
          int LDA   = nrowsTot;
          int LWORK = 2*ncolsTot;
          double *WORK = (double *)malloc(LWORK*sizeof(double));
          double *TAU = (double *)malloc(ncolsTot*sizeof(double));
-         double *R = (double *)malloc(ncolsTot*ncolsTot*sizeof(double));
+         RLapack = (double *)malloc(ncolsTot*ncolsTot*sizeof(double));
 
          double LP_START = get_cur_time();
-         dgeqrf_(&nrowsTot, &ncolsTot, A_copy, &LDA,
+         dgeqrf_(&nrowsTot, &ncolsTot, ALapack, &LDA,
                  TAU, WORK, &LWORK, &INFO);
-
          // extract R
-         memset(R, 0, ncolsTot*ncolsTot*sizeof(double));
+         memset(RLapack, 0, ncolsTot*ncolsTot*sizeof(double));
          for(int j = 0; j < ncolsTot; ++j)
             for(int i = 0; i <= j; ++i)
-               R[j*ncolsTot+i] = A_copy[j*nrowsTot+i];
-
+               RLapack[j*ncolsTot+i] = ALapack[j*nrowsTot+i];
          // extract Q
-         dorgqr_(&nrowsTot, &ncolsTot, &ncolsTot, A_copy, &LDA, TAU, WORK, &LWORK, &INFO);
+         dorgqr_(&nrowsTot, &ncolsTot, &ncolsTot, ALapack, &LDA, TAU, WORK, &LWORK, &INFO);
          double LP_END = get_cur_time();
          printf("lapack wall time = %.6e\n", LP_END-LP_START);
-
-//         for(int j = 0; j < ncolsTot; ++j)
-//            for(int i = 0; i < nrowsTot; ++i)
-//               printf("AQR[%i][%i] = %lf\n", i, j, A_copy[j*nrowsTot+i]);
-//         printf("\n");
 
          // test A_Test = Q*R
          double *A_Test = (double *)malloc(nrowsTot*ncolsTot*sizeof(double));
@@ -106,51 +96,29 @@ int main(int argc, char *argv[])
          for(int i = 0; i < nrowsTot; ++i)
             for(int j = 0; j < ncolsTot; ++j)
                for(int k = 0; k < ncolsTot; ++k)
-                  A_Test[j*nrowsTot+i] += A_copy[k*nrowsTot+i]*R[j*ncolsTot+k];
-//         for(int j = 0; j < ncolsTot; ++j)
-//            for(int i = 0; i < nrowsTot; ++i)
-//               printf("ATest[%i][%i] = %lf\n", i, j, A_Test[j*nrowsTot+i]);
-//         printf("\n");
-
+                  A_Test[j*nrowsTot+i] += ALapack[k*nrowsTot+i]*RLapack[j*ncolsTot+k];
+         double lapackRes = computeRes(nrowsTot*ncolsTot, A_Test, A);
+         printf("lapack residual = %.16e\n\n", lapackRes);
          free(A_Test);
-         free(R);
          free(TAU);
          free(WORK);
-         free(A_copy);
       }
 
-      bcyclA = (double**)malloc(numprocs*sizeof(double*));
-      for(int i = 0; i < numprocs; ++i)
-         bcyclA[i] = (double *)malloc(nrowsTot*ncolsLoc*sizeof(double));
-
-      for(int pid = 0; pid < numprocs; ++pid)
-         for(int j = 0; j < ncolsLoc; ++j)
-            for(int i = 0; i < nrowsTot; ++i)
-               bcyclA[pid][j*nrowsTot+i] = A[(j*numprocs+pid)*nrowsTot+i];
-
-         for(int j = 0; j < ncolsLoc; ++j)
-            for(int i = 0; i < nrowsTot; ++i)
-            ALoc[j*nrowsTot+i] = bcyclA[0][j*nrowsTot+i];
-
+      // ALoc for process 0
+      for(int j = 0; j < ncolsLoc; ++j)
+         for(int i = 0; i < nrowsTot; ++i)
+            ALoc[j*nrowsTot+i] = A[j*nrowsTot+i];
+      // send ALoc for remaining processes
       for(int pid = 1; pid < numprocs; ++pid)
-         MPI_Send(&bcyclA[pid][0], nrowsTot*ncolsLoc, MPI_DOUBLE, pid, pid, MPI_COMM_WORLD);
-//      for(int j = 0; j < ncolsTot; ++j)
-//         for(int i = 0; i < nrowsTot; ++i)
-//            printf("AGlob[%i][%i] = %lf\n", i, j, A[j*nrowsTot+i]);
-//      printf("\n");
-
-//      for(int pid = 0; pid < numprocs; ++pid)
-//         for(int i = 0; i < nrowsTot; ++i)
-//            for(int j = 0; j < ncolsLoc; ++j)
-//               printf("bcyclA[%i][%i][%i]= %lf\n", pid, i, j, bcyclA[pid][i*ncolsLoc+j]);
-   }
+         MPI_Send(&A[pid*ncolsLoc*nrowsTot], nrowsTot*ncolsLoc, MPI_DOUBLE, pid, pid, MPI_COMM_WORLD);
+   } // process 0
    if(procId != 0)
       MPI_Recv(&ALoc[0], nrowsTot*ncolsLoc, MPI_DOUBLE, 0, procId, MPI_COMM_WORLD, &status);
+   MPI_Barrier(MPI_COMM_WORLD);
 
    int iam, nprocs;
    blacs_pinfo_(&iam, &nprocs);
-
-   // nprocs x 1 processor layout
+   // 1 x nprocs processor layout
    int nprow = 1;
    int npcol = nprocs;
    char layout = 'C';
@@ -165,27 +133,7 @@ int main(int argc, char *argv[])
    int izero = 0;
    int mpA   = numroc_(&nrowsTot, &mb, &rowLoc, &izero, &nprow);
    int nqA   = numroc_(&ncolsTot, &nb, &colLoc, &izero, &npcol);
-//   printf("mpA = %i\n", mpA);
-//   printf("nqA = %i\n", nqA);
-//   printf("rowLoc = %i\n", rowLoc);
-//   printf("colLoc = %i\n", colLoc);
-//   printf("row blocking factor = %i\n", mb);
-//   printf("column blocking factor = %i\n", nb);
-//   for(int pid = 0; pid < numprocs; ++pid)
-//   {
-//      if(procId == pid)
-//      {
-//         printf("pid = %i\n", procId);
-//         for(int i = 0; i < mpA; ++i)
-//            for(int j = 0; j < nqA; ++j)
-//               printf("ALoc[%i][%i] = %lf\n", i, j, ALoc[i*ncolsLoc+j]);
-//         printf("\n");
-//      }
-//      MPI_Barrier(MPI_COMM_WORLD);
-//   }
-   MPI_Barrier(MPI_COMM_WORLD);
 
-   // 1 rhs for each process
    izero = 0;
    int info;
    int lddA = mpA;
@@ -196,64 +144,130 @@ int main(int argc, char *argv[])
    if(info != 0)
       printf("Error in descinit, info = %d\n", info);
 
-
    int IA = 1;
    int JA = 1;
-   double *tauLoc = (double *)malloc(ncolsTot*sizeof(double));
-   int lworkLoc = nrowsTot*ncolsTot*4;
+   int INFO = 0;
+   int lworkLoc = nrowsTot*ncolsLoc*4;
    double *workLoc = (double *)malloc(lworkLoc*sizeof(double));
-   int INFO   = 0;
+   double *tauLoc = (double *)malloc(ncolsTot*sizeof(double));
 
    MPI_Barrier(MPI_COMM_WORLD);
    double MPI_start, MPI_end;
    if(procId == 0) { MPI_start = MPI_Wtime(); }
    pdgeqrf_(&nrowsTot, &ncolsTot, ALoc, &IA, &JA, descA,
-         tauLoc, workLoc, &lworkLoc, &INFO);
-   pdorgqr_(&nrowsTot, &ncolsTot, &nqA, ALoc, &IA, &JA, descA,
-              tauLoc, workLoc, &lworkLoc, &INFO);
+            tauLoc, workLoc, &lworkLoc, &INFO);
+   // extract RLoc
+   memset(RLoc, 0, ncolsTot*ncolsLoc*sizeof(double));
+   for(int j = 0; j < ncolsLoc; ++j)
+      for(int i = 0; i < ncolsTot; ++i)
+         RLoc[j*ncolsTot+i] = ALoc[j*nrowsTot+i];
+
+   pdorgqr_(&nrowsTot, &ncolsTot, &ncolsTot, ALoc, &IA, &JA, descA,
+            tauLoc, workLoc, &lworkLoc, &INFO);
    MPI_Barrier(MPI_COMM_WORLD);
    if(procId == 0) {
       MPI_end = MPI_Wtime();
-      printf("scalapack wall time: %.6e seconds\n\n", MPI_end-MPI_start);
+      printf("scalapack wall time: %.6e seconds\n", MPI_end-MPI_start);
    }
-   MPI_Barrier(MPI_COMM_WORLD);
 
-//   for(int pid = 0; pid < numprocs; ++pid)
-//   {
-//      if(procId == pid)
-//      {
-//         printf("pid = %i\n", procId);
-//         for(int j = 0; j < ncolsLoc; ++j)
-//            for(int i = 0; i < nrowsTot; ++i)
-//               printf("AQRLoc[%i][%i] = %lf\n", i, j, ALoc[j*nrowsTot+i]);
-//
-//         for(int j = 0; j < ncolsLoc; ++j)
-//         {
-//            double dot = 0.0;
-//            for(int i = 0; i < nrowsTot; ++i)
-//               dot += ALoc[j*nrowsTot+i]*ALoc[j*nrowsTot+i];
-//            printf("dotLoc = %lf\n", dot);
-//         }
-//         printf("\n");
-//      }
-//      MPI_Barrier(MPI_COMM_WORLD);
-//   }
+   for(int pid = 1; pid < numprocs; ++pid)
+   {
+      if(procId == pid)
+         MPI_Send(ALoc, nrowsTot*ncolsLoc, MPI_DOUBLE, 0, pid, MPI_COMM_WORLD);
+      if(procId == pid)
+         MPI_Send(RLoc, ncolsTot*ncolsLoc, MPI_DOUBLE, 0, 2*pid, MPI_COMM_WORLD);
+   }
 
-   free(ALoc);
-   free(workLoc);
-   free(tauLoc);
    if(procId == 0)
    {
-      for(int i = 0; i < numprocs; ++i)
-         free(bcyclA[i]);
-      free(bcyclA);
+      for(int pid = 1; pid < numprocs; ++pid)
+         MPI_Recv(&Q_MPI[nrowsTot*ncolsLoc*pid], nrowsTot*ncolsLoc, MPI_DOUBLE, pid, pid, MPI_COMM_WORLD, &status);
+      for(int pid = 1; pid < numprocs; ++pid)
+         MPI_Recv(&R_MPI[ncolsTot*ncolsLoc*pid], ncolsTot*ncolsLoc, MPI_DOUBLE, pid, 2*pid, MPI_COMM_WORLD, &status);
+
+      for(int i = 0; i < nrowsTot*ncolsLoc; ++i)
+         Q_MPI[i] = ALoc[i];
+      for(int i = 0; i < ncolsTot*ncolsLoc; ++i)
+         R_MPI[i] = RLoc[i];
+   }
+
+   // compare results
+   if(procId == 0)
+   {
+      for(int j = 0; j < ncolsTot; ++j)
+         for(int i = ncolsTot-1; i > j; --i)
+            R_MPI[j*ncolsTot+i] = 0.0;
+
+      memset(A_MPI, 0, nrowsTot*ncolsTot*sizeof(double));
+      for(int i = 0; i < nrowsTot; ++i)
+         for(int j = 0; j < ncolsTot; ++j)
+            for(int k = 0; k <=  j; ++k)
+               A_MPI[j*nrowsTot+i] += Q_MPI[k*nrowsTot+i]*R_MPI[j*ncolsTot+k];
+
+      double scalapackRes = computeRes(nrowsTot*ncolsTot, A_MPI, A);
+      printf("scalapackRes residual = %.16e\n\n", scalapackRes);
+
+      double QnormLapack   = compute_norm(nrowsTot*ncolsTot, ALapack);
+      printf("Q norm lapack = %.16e\n", QnormLapack);
+      double QnormScalapack = compute_norm(nrowsTot*ncolsTot, Q_MPI);
+      printf("Q norm scalapack = %.16e\n", QnormScalapack);
+
+      double RnormLapack  = compute_norm(ncolsTot*ncolsTot, RLapack);
+      printf("R norm lapack = %.16e\n", RnormLapack);
+      double RnormScalapack = compute_norm(ncolsTot*ncolsTot, R_MPI);
+      printf("R norm scalapack = %.16e\n", RnormScalapack);
+   }
+   if(procId == 0)
+   {
       free(A);
       free(Q_MPI);
       free(R_MPI);
       free(A_MPI);
+      free(RLapack);
+      free(ALapack);
    }
+   free(ALoc);
+   free(workLoc);
+   free(tauLoc);
 
    blacs_gridexit_(&ictxt);
    mpi_err = MPI_Finalize();
    return EXIT_SUCCESS;
 }
+
+
+void PrintUpper(int M, int N, double *A, const char *name)
+{
+   for(int j = 0; j < N; ++j)
+      for(int i = 0; i <= j; ++i)
+         printf("%s[%i][%i] = %lf\n", name, i, j, A[j*M+i]);
+   printf("\n");
+}
+
+void PrintFull(int M, int N, double *A, const char *name)
+{
+   for(int j = 0; j < N; ++j)
+      for(int i = 0; i < M; ++i)
+         printf("%s[%i][%i] = %lf\n", name, i, j, A[j*M+i]);
+   printf("\n");
+}
+
+double compute_norm(int len, double *v)
+{
+   double norm = 0.0;
+   for(int i = 0; i < len; ++i)
+      norm += v[i]*v[i];
+
+   return sqrt(norm);
+}
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+double computeRes(int len, double *A, double *B)
+{
+   double norm = 0.0;
+   for(int i = 0; i < len; ++i)
+      norm = MAX(norm, fabs(A[i]-B[i]));
+
+   return norm;
+}
+

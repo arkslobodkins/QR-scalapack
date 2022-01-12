@@ -1,12 +1,12 @@
-OBJS = pdgels.o main.o get_time.o
+OBJS =  main.o get_time.o
 
-all: pdgels
+all: qr
 
-pdgels: $(OBJS)
-	-mpif90 -O3 -o pdgels.out $(OBJS) libscalapack.a -llapack -lblas -lm
+qr: $(OBJS)
+	-mpif90 -O3 -o qr.x $(OBJS) libscalapack.a -llapack -lblas -lm
 
 clean :
-	rm -f $(OBJS) pdgels.out
+	rm -f $(OBJS) qr.x
 
 .f.o : ; mpif90 -c -O3 $*.f
 
