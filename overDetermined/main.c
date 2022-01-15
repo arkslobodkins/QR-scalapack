@@ -73,7 +73,7 @@ int main(int argc, char *argv[])
       b       = (double *)malloc(nrowsTot*sizeof(double));
       A_MPI = (double *)malloc(rowsCols*sizeof(double));
       Q_MPI = (double *)malloc(rowsCols*sizeof(double));
-      R_MPI = (double *)malloc(rowsCols*sizeof(double));
+      R_MPI = (double *)malloc(ncolsTot*ncolsTot*sizeof(double));
       ALapack = (double *)malloc(rowsCols*sizeof(double));
       RLapack = (double *)malloc(ncolsTot*ncolsTot*sizeof(double));
       xLapack = (double *)malloc(ncolsTot*sizeof(double));
@@ -208,10 +208,6 @@ int main(int argc, char *argv[])
    // compare results
    if(procId == 0)
    {
-      for(int i = 0; i < nrowsTot*ncolsLoc; ++i)
-         Q_MPI[i] = ALoc[i];
-      for(int i = 0; i < ncolsTot*ncolsLoc; ++i)
-         R_MPI[i] = RLoc[i];
       for(int j = 0; j < ncolsTot; ++j)
          for(int i = ncolsTot-1; i > j; --i)
             R_MPI[j*ncolsTot+i] = 0.0;
